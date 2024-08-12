@@ -1,0 +1,119 @@
+#include "imports/stdlib.fc";
+
+global int next_item_index;
+global slice owner;
+global cell item_code;
+global cell content;
+global int creation_date;
+
+() load_data() impure inline {
+    var ds = get_data().begin_parse();
+    next_item_index = ds~load_uint(64);
+    owner           = ds~load_msg_addr();
+
+    slice list_data      = ds~load_ref().begin_parse();
+    content              = list_data~load_ref();
+    creation_date        = list_data~load_uint(32);
+
+    item_code       = ds~load_ref();
+}
+
+() save_data() impure inline {
+    set_data(
+        begin_cell()
+        .store_uint(next_item_index, 64)
+        .store_slice(owner)
+        .store_ref(
+                begin_cell()
+                .store_ref(content)
+                .store_uint(creation_date, 32)
+                .end_cell()
+        )
+        .store_ref(item_code)
+        .end_cell()
+    );
+}
+
+;; a function that calculates the init state of n-th item's smart contract
+cell calculate_item_state_init(int item_index, cell item_code) {
+    cell data = begin_cell().store_uint(item_index, 64).store_slice(my_address()).end_cell();
+    return begin_cell().store_uint(0, 2).store_dict(item_code).store_dict(data).store_uint(0, 1).end_cell();
+}
+
+;; a function to calculate the address of an item using it's state_init
+slice calculate_item_address(int wc, cell state_init) {
+    return begin_cell().store_uint(4, 3)
+    .store_int(wc, 8)
+    .store_uint(cell_hash(state_init), 256)
+    .end_cell()
+    .begin_parse();
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; ignore empty messages
+        return ();
+    }
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    if (flags & 1) {  ;; ignore all bounced messages
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    load_data(); ;; we load data from storage to our global variables
+
+    ;; check if the sender of this message is the owner of our to-do list
+    throw_unless(401, equal_slices(sender_address, owner));
+
+    ;; loading operation code that shows which operations is being called
+    int op = in_msg_body~load_uint(32);
+
+    if(op == 1) {
+        ;; creating new item for our list ...
+        ;; we have to deploy a new item with the initial data and the item_code
+        ;; to deploy a smart contract we need a set of variables
+        ;; state_init, item_address, message_body (item's owner+content)
+        ;; we are going to use next_item_index for the new item
+
+        cell state_init = calculate_item_state_init(next_item_index, item_code);
+        slice item_address = calculate_item_address(0, state_init);
+        var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(item_address)
+        ;; amount that will be forwarded to the item's contract
+        ;; set to zero because we want to use SendRemainingValue mode to carry remaining msg_value of this atomic transaction
+        .store_coins(0)
+        .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
+        .store_ref(state_init)
+        ;; the reference below will containt the body of our message that will be received through recv_internal function inside item's contract
+        .store_ref(
+            begin_cell()
+            .store_slice(owner)
+            ;; we will use the content cell sent by the owner to create this new item
+            .store_ref(in_msg_body~load_ref())
+            .end_cell()
+        );
+
+        send_raw_message(msg.end_cell(), 64);
+
+        ;; do not forget to update storage and increament next_item_index by one for the next item
+        next_item_index += 1;
+        save_data();
+
+        return ();
+    }
+}
+
+;; Get Methods
+
+slice get_item_address_by_index(int index) method_id {
+    load_data();
+    cell state_init = calculate_item_state_init(index, item_code);
+    return calculate_item_address(0, state_init);
+}
+
+(int, slice, cell) get_storage_data() method_id {
+    load_data();
+    return (next_item_index, owner, item_code);
+}
